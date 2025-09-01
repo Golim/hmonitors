@@ -9,9 +9,11 @@ import traceback
 import argparse
 import logging
 import asyncio
+import signal
 import shlex
 import yaml
 import json
+import time
 import sys
 import os
 
@@ -171,6 +173,61 @@ def get_monitors():
     '''
     result = subprocess.run(['hyprctl', 'monitors', 'all', '-j'], capture_output=True, text=True)
     return json.loads(result.stdout)
+
+def kill_existing_instances():
+    '''
+    Kill other running instances of this script (exclude current PID).
+    Uses pgrep -f to find processes whose command line contains the script name,
+    sends SIGTERM, waits briefly, then SIGKILL for any remaining PIDs.
+    '''
+    try:
+        script_name = os.path.basename(__file__)
+    except Exception:
+        script_name = 'hmonitors.py'
+
+    try:
+        p = subprocess.run(['pgrep', '-f', script_name], capture_output=True, text=True)
+        if p.returncode != 0 or not p.stdout:
+            return
+        pids = [int(x) for x in p.stdout.split()]
+    except Exception:
+        logging.debug('Could not query running processes to kill existing instances')
+        return
+
+    current = os.getpid()
+    # Send SIGTERM
+    for pid in pids:
+        if pid == current:
+            continue
+        try:
+            logging.debug(f'Sending SIGTERM to existing hmonitors instance {pid}')
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except Exception:
+            logging.debug(f'Failed to send SIGTERM to {pid}')
+
+    # Wait for processes to exit, then SIGKILL any remaining
+    for _ in range(6):
+        alive = []
+        for pid in pids:
+            if pid == current:
+                continue
+            try:
+                os.kill(pid, 0)
+                alive.append(pid)
+            except OSError:
+                pass
+        if not alive:
+            return
+        time.sleep(0.5)
+
+    for pid in alive:
+        try:
+            logging.debug(f'Sending SIGKILL to existing hmonitors instance {pid}')
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            logging.debug(f'Failed to send SIGKILL to {pid}')
 
 def load_config(config_file):
     '''
@@ -395,6 +452,7 @@ async def main():
     parser.add_argument('-c', '--config', help='Config file', default='~/.config/hmonitors/config.yaml')
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output')
     parser.add_argument('--hook', action='store_true', help='Listen to hyprland events and apply the configuration')
+    parser.add_argument('-w', '--watch', action='store_true', help='Watch config file for changes and re-apply configuration. On by default when hook mode is enabled')
     args = parser.parse_args()
 
     if args.verbose:
@@ -402,24 +460,79 @@ async def main():
     else:
         logging.basicConfig(level=logging.INFO, format='%(message)s')
 
+    # Ensure only one instance runs at a time
+    kill_existing_instances()
+
     config_file = os.path.expanduser(args.config)
     if not os.path.exists(config_file):
         logging.error(f'Config file {config_file} does not exist')
         sys.exit(1)
+
+    watch_enabled = args.watch or args.hook  # Enable watching if requested or when in hook mode
+
+    async def monitor_config_changes(config_path, poll_interval=1.0):
+        '''
+        Async polling watcher for the config file. When a change in mtime
+        is detected, call setup_monitors to apply the new configuration.
+        '''
+        try:
+            last_mtime = os.path.getmtime(config_path)
+        except Exception:
+            last_mtime = None
+
+        while True:
+            await asyncio.sleep(poll_interval)
+            try:
+                mtime = os.path.getmtime(config_path)
+            except Exception:
+                # The file might have been deleted or is temporarily unavailable
+                continue
+            if last_mtime is None:
+                last_mtime = mtime
+                continue
+            if mtime != last_mtime:
+                logging.info(f'Config file {config_path} changed, re-applying configuration')
+                try:
+                    # Run the (blocking) setup in a thread
+                    await asyncio.to_thread(setup_monitors, config_path)
+                except Exception as e:
+                    logging.error(f'Failed to re-apply configuration: {e}')
+                    logging.debug(traceback.format_exc())
+                last_mtime = mtime
+
     if args.hook:
         logging.info('Running in hook mode, listening to events')
-
         # Setup the monitors once
         setup_monitors(config_file)
 
-        # Listen to events
+        # Start the config watcher if requested
+        watcher_task = None
+        if watch_enabled:
+            watcher_task = asyncio.create_task(monitor_config_changes(config_file))
+
+        # Listen to events concurrently with the watcher
         listener = EventListener()
 
-        async for event in listener.start():
-            if any(event_name in event for event_name in ['monitoradded', 'monitorremoved']):
-                setup_monitors(config_file)
+        async def event_loop():
+            async for event in listener.start():
+                if any(event_name in event for event_name in ['monitoradded', 'monitorremoved']):
+                    # Run the potentially blocking setup in a thread
+                    await asyncio.to_thread(setup_monitors, config_file)
+
+        # Run both tasks and wait until they finish
+        try:
+            if watcher_task:
+                await asyncio.gather(event_loop(), watcher_task)
+            else:
+                await event_loop()
+        except asyncio.CancelledError:
+            pass
     else:
+        # Non-hook mode: apply once, then optionally watch for changes
         setup_monitors(config_file)
+        if watch_enabled:
+            # Run watcher forever
+            await monitor_config_changes(config_file)
 
 if __name__ == '__main__':
     try:
