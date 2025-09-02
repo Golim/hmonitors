@@ -9,6 +9,7 @@ import traceback
 import argparse
 import logging
 import asyncio
+import shutil
 import signal
 import shlex
 import yaml
@@ -352,6 +353,20 @@ def apply_configuration(monitor):
     subprocess.run(shlex.split(command), capture_output=True, text=True)
     logging.debug(f'Applied configuration for monitor {monitor.name} ({monitor.id}): {command}')
 
+
+def send_notification(summary, title='Hmonitors'):
+    '''
+    Send a desktop notification using notify-send if available.
+    '''
+    try:
+        # Only attempt if notify-send is present on the system
+        if shutil.which('notify-send') is None:
+            logging.debug('notify-send not found, skipping desktop notification')
+            return
+        subprocess.run(['notify-send', title, summary], check=False)
+    except Exception:
+        logging.debug('Failed to send notification', exc_info=True)
+
 def setup_monitors(config_file):
     '''
     Setup the monitors
@@ -444,8 +459,14 @@ def setup_monitors(config_file):
             monitors[monitor].position = f'{x}x{y}'
 
     # Apply the configuration
+    applied = []
     for monitor in monitors:
         apply_configuration(monitors[monitor])
+        applied.append(monitors[monitor].name)
+
+    # Send a desktop notification summarizing the applied configuration
+    if applied:
+        send_notification(f'Applied configuration for monitors: {", ".join(applied)}')
 
 async def main():
     parser = argparse.ArgumentParser(description='Monitor configuration')
