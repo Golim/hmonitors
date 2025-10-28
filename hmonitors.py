@@ -128,8 +128,7 @@ class Monitor:
         :return: None
         '''
         if align not in ['left', 'right', 'top', 'bottom', 'center']:
-            logging.error(f'Invalid align value {align} for monitor {self.name}')
-            sys.exit(1)
+            raise ValueError(f'Invalid align value {align} for monitor {self.name}')
         self.align = align
 
     def set_scale(self, scale):
@@ -265,8 +264,7 @@ def select_monitors(monitors, match):
             selected_monitor.append(monitor)
 
     if len(selected_monitor) > 1:
-        logging.error(f'Multiple monitors found for {match}. Please provide a more specific match')
-        sys.exit(1)
+        raise ValueError(f'Multiple monitors found for {match}. Please provide a more specific match')
 
     return selected_monitor[0] if selected_monitor else None
 
@@ -371,11 +369,13 @@ def setup_monitors(config_file):
     '''
     Setup the monitors
     :return: None
+    :raises ValueError: if configuration is invalid
     '''
     config = load_config(config_file)
 
     hyprctl_monitors = get_monitors()
     monitors = {}
+    matched_physical_monitors = {}
 
     # Match the monitors with the configuration
     for monitor in config['monitors']:
@@ -383,12 +383,20 @@ def setup_monitors(config_file):
             match = config['monitors'][monitor]['match']
             selected_monitor = select_monitors(hyprctl_monitors, match)
         else:
-            logging.error(f'No match found for {monitor}')
-            sys.exit(1)
+            raise ValueError(f'No match found for {monitor}')
 
         if not selected_monitor:
             logging.info(f'No monitor found for {monitor}')
             continue
+
+        # Check if this physical monitor has already been matched
+        physical_id = selected_monitor['name']
+        if physical_id in matched_physical_monitors:
+            raise ValueError(f'Monitor {physical_id} matches multiple configurations: '
+                           f'{matched_physical_monitors[physical_id]} and {monitor}. '
+                           f'Please provide a more specific match.')
+        
+        matched_physical_monitors[physical_id] = monitor
 
         # Initialize the monitor
         # The name of the monitor from `hyprctl monitors` is used as the id
@@ -409,8 +417,7 @@ def setup_monitors(config_file):
             position = monitor_config['position']
             relative_to = position.split()[1]
             if relative_to not in monitors:
-                logging.error(f'Monitor {relative_to} not found')
-                sys.exit(1)
+                raise ValueError(f'Monitor {relative_to} not found')
             # TODO: check for conflicts
             if 'above' in position:
                 monitors[monitor].set_below(relative_to)
@@ -514,8 +521,9 @@ async def main():
             if mtime != last_mtime:
                 logging.info(f'Config file {config_path} changed, re-applying configuration')
                 try:
-                    # Run the (blocking) setup in a thread
                     await asyncio.to_thread(setup_monitors, config_path)
+                except ValueError as e:
+                    logging.error(f'Configuration error: {e}')
                 except Exception as e:
                     logging.error(f'Failed to re-apply configuration: {e}')
                     logging.debug(traceback.format_exc())
@@ -523,8 +531,24 @@ async def main():
 
     if args.hook:
         logging.info('Running in hook mode, listening to events')
+
+        # Prevent concurrent setup_monitors executions
+        setup_lock = asyncio.Lock()
+
+        async def apply_setup():
+            """Apply setup_monitors only if not already running"""
+            if setup_lock.locked():
+                logging.debug('Setup already in progress, skipping')
+                return
+            async with setup_lock:
+                try:
+                    await asyncio.to_thread(setup_monitors, config_file)
+                except ValueError as e:
+                    logging.error(str(e))
+                    sys.exit(1)
+
         # Setup the monitors once
-        setup_monitors(config_file)
+        await apply_setup()
 
         # Start the config watcher if requested
         watcher_task = None
@@ -537,8 +561,7 @@ async def main():
         async def event_loop():
             async for event in listener.start():
                 if any(event_name in event for event_name in ['monitoradded', 'monitorremoved']):
-                    # Run the potentially blocking setup in a thread
-                    await asyncio.to_thread(setup_monitors, config_file)
+                    await apply_setup()
 
         # Run both tasks and wait until they finish
         try:
@@ -550,7 +573,11 @@ async def main():
             pass
     else:
         # Non-hook mode: apply once, then optionally watch for changes
-        setup_monitors(config_file)
+        try:
+            setup_monitors(config_file)
+        except ValueError as e:
+            logging.error(str(e))
+            sys.exit(1)
         if watch_enabled:
             # Run watcher forever
             await monitor_config_changes(config_file)
