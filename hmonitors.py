@@ -335,6 +335,21 @@ def set_position(monitors, monitor, position='0x0'):
 
     # No need for the above and left monitors since we start from the upmost leftmost monitor
 
+def get_hyprland_version():
+    '''
+    Get the version of hyprland
+    :return: version of hyprland
+    :rtype: str
+    '''
+    result = subprocess.run(['hyprctl', 'version'], capture_output=True, text=True)
+    try:
+        version_line = result.stdout.splitlines()[0]
+        version = int(version_line.split()[1].split('.')[1])
+    except (IndexError, ValueError):
+        logging.error('Failed to parse hyprland version')
+        return 0
+    return version
+
 def apply_configuration(monitor):
     '''
     Apply the configuration for the monitor
@@ -343,10 +358,19 @@ def apply_configuration(monitor):
     :type monitor: Monitor
     :return: None
     '''
-    command = f'hyprctl keyword monitor {monitor.id},{monitor.resolution},'
-    command += f'{monitor.position},{monitor.scale}'
-    if monitor.extra:
-        command += f',{monitor.extra}'
+    hyprland_version = get_hyprland_version()
+    if hyprland_version < 55:
+        # Use the old `hyprctl keyword` syntax for older versions of hyprland
+        command = f'hyprctl keyword monitor {monitor.id},{monitor.resolution},'
+        command += f'{monitor.position},{monitor.scale}'
+        if monitor.extra:
+            command += f',{monitor.extra}'
+    else:
+        # Use `hyprctl eval` with the new lua syntax
+        command = f'hyprctl eval \'hl.monitor({{output="{monitor.id}", mode="{monitor.resolution}", position="{monitor.position}", scale="{monitor.scale}"'
+        if monitor.extra:
+            command += f', extra="{monitor.extra}"'
+        command += '})\''
 
     subprocess.run(shlex.split(command), capture_output=True, text=True)
     logging.debug(f'Applied configuration for monitor {monitor.name} ({monitor.id}): {command}')
