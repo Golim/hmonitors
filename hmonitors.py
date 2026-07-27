@@ -369,7 +369,9 @@ def apply_configuration(monitor):
         # Use `hyprctl eval` with the new lua syntax
         command = f'hyprctl eval \'hl.monitor({{output="{monitor.id}", mode="{monitor.resolution}", position="{monitor.position}", scale="{monitor.scale}"'
         if monitor.extra:
-            command += f', extra="{monitor.extra}"'
+            command += f', {monitor.extra}'
+        else:
+            command += ', mirror=""'
         command += '})\''
 
     subprocess.run(shlex.split(command), capture_output=True, text=True)
@@ -459,7 +461,11 @@ def setup_monitors(config_file):
                 monitors[monitor].set_position('auto')
                 monitors[monitor].set_resolution('preferred')
                 monitors[monitor].set_scale('1')
-                monitors[monitor].set_extra(f'mirror,{monitors[relative_to].id}')
+                hyprland_version = get_hyprland_version()
+                if hyprland_version < 55:
+                    monitors[monitor].set_extra(f'mirror,{monitors[relative_to].id}')
+                else:
+                    monitors[monitor].set_extra(f'mirror="{monitors[relative_to].id}"')
 
         if 'scale' in monitor_config:
             monitors[monitor].set_scale(monitor_config['scale'])
